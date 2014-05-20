@@ -8,7 +8,8 @@
 ping -c 1 -W 10 127.0.0.2 > /dev/null 2>&1
 if [ $? -eq 0 ]
 then
-    exit
+    echo "setup has already run"
+    exit 1
 fi
 
 # If we're not on OS X, then error
@@ -17,7 +18,7 @@ case $OSTYPE in
         ;;
     *)
         echo "Can't setup interfaces on non-Mac. Error!"
-        exit 1
+        exit 2
         ;;
 esac
 
