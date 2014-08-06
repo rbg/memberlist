@@ -3,7 +3,6 @@ package memberlist
 import (
 	"bytes"
 	"fmt"
-	"github.com/armon/go-metrics"
 	"math"
 	"math/rand"
 	"net"
@@ -206,8 +205,6 @@ START:
 
 // probeNode handles a single round of failure checking on a node
 func (m *Memberlist) probeNode(node *nodeState) {
-	defer metrics.MeasureSince([]string{"memberlist", "probeNode"}, time.Now())
-
 	// Send a ping to the node
 	ping := ping{SeqNo: m.nextSeqNo(), Node: node.Name}
 	destAddr := &net.UDPAddr{IP: node.Addr, Port: int(node.Port)}
@@ -289,8 +286,6 @@ func (m *Memberlist) resetNodes() {
 // gossip is invoked every GossipInterval period to broadcast our gossip
 // messages to a few random nodes.
 func (m *Memberlist) gossip() {
-	defer metrics.MeasureSince([]string{"memberlist", "gossip"}, time.Now())
-
 	// Get some random live nodes
 	m.nodeLock.RLock()
 	excludes := []string{m.config.Name}
@@ -343,8 +338,6 @@ func (m *Memberlist) pushPull() {
 
 // pushPullNode does a complete state exchange with a specific node.
 func (m *Memberlist) pushPullNode(addr []byte, port uint16, join bool) error {
-	defer metrics.MeasureSince([]string{"memberlist", "pushPullNode"}, time.Now())
-
 	// Attempt to send and receive with the node
 	remote, userState, err := m.sendAndReceiveState(addr, port, join)
 	if err != nil {
@@ -627,9 +620,6 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		return
 	}
 
-	// Update metrics
-	metrics.IncrCounter([]string{"memberlist", "msg", "alive"}, 1)
-
 	// Store the old state and meta data
 	oldState := state.State
 	oldMeta := state.Meta
@@ -758,9 +748,6 @@ func (m *Memberlist) suspectNode(s *suspect) {
 		m.encodeAndBroadcast(s.Node, suspectMsg, s)
 	}
 
-	// Update metrics
-	metrics.IncrCounter([]string{"memberlist", "msg", "suspect"}, 1)
-
 	// Update the state
 	state.Incarnation = s.Incarnation
 	state.State = stateSuspect
@@ -841,9 +828,6 @@ func (m *Memberlist) deadNode(d *dead) {
 	} else {
 		m.encodeAndBroadcast(d.Node, deadMsg, d)
 	}
-
-	// Update metrics
-	metrics.IncrCounter([]string{"memberlist", "msg", "dead"}, 1)
 
 	// Update the state
 	state.Incarnation = d.Incarnation

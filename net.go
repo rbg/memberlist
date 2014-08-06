@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"github.com/armon/go-metrics"
 	"github.com/ugorji/go/codec"
 	"io"
 	"net"
@@ -177,7 +176,6 @@ func (m *Memberlist) tcpListen() {
 func (m *Memberlist) handleConn(conn *net.TCPConn) {
 	// m.logger.Printf("[DEBUG] memberlist: Responding to push/pull sync with: %s", conn.RemoteAddr())
 	defer conn.Close()
-	metrics.IncrCounter([]string{"memberlist", "tcp", "accept"}, 1)
 
 	join, remoteNodes, userState, err := m.readRemoteState(conn)
 	if err != nil {
@@ -243,7 +241,6 @@ func (m *Memberlist) udpListen() {
 		lastPacket = time.Now()
 
 		// Ingest this packet
-		metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
 		m.ingestPacket(buf[:n], addr)
 	}
 }
@@ -496,7 +493,6 @@ func (m *Memberlist) rawSendMsg(to net.Addr, msg []byte) error {
 		msg = buf.Bytes()
 	}
 
-	metrics.IncrCounter([]string{"memberlist", "udp", "sent"}, float32(len(msg)))
 	_, err := m.udpListener.WriteTo(msg, to)
 	return err
 }
@@ -511,8 +507,7 @@ func (m *Memberlist) sendAndReceiveState(addr []byte, port uint16, join bool) ([
 		return nil, nil, err
 	}
 	defer conn.Close()
-	// m.logger.Printf("[DEBUG] memberlist: Initiating push/pull sync with: %s", conn.RemoteAddr())
-	metrics.IncrCounter([]string{"memberlist", "tcp", "connect"}, 1)
+	//	m.logger.Printf("[DEBUG] memberlist: Initiating push/pull sync with: %s", conn.RemoteAddr())
 
 	// Send our state
 	if err := m.sendLocalState(conn, join); err != nil {
@@ -611,7 +606,6 @@ func (m *Memberlist) sendLocalState(conn net.Conn, join bool) error {
 	}
 
 	// Write out the entire send buffer
-	metrics.IncrCounter([]string{"memberlist", "tcp", "sent"}, float32(len(sendBuf)))
 	if _, err := conn.Write(sendBuf); err != nil {
 		return err
 	}
