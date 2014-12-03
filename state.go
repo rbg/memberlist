@@ -724,6 +724,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 
 	// If this is us we need to refute, otherwise re-broadcast
 	if state.Name == m.config.Name {
+
 		inc := m.nextIncarnation()
 		for s.Incarnation >= inc {
 			inc = m.nextIncarnation()
@@ -742,7 +743,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			},
 		}
 		m.encodeAndBroadcast(s.Node, aliveMsg, a)
-		m.logger.Printf("[WARN] memberlist: Refuting a suspect message")
+		m.logger.Printf("[WARN] memberlist: Refuting a suspect message (state: %#v )", state)
 		return // Do not mark ourself suspect
 	} else {
 		m.encodeAndBroadcast(s.Node, suspectMsg, s)
