@@ -32,6 +32,10 @@ type Node struct {
 	DCur uint8  // Current version delegate is speaking
 }
 
+func (n Node) String() string {
+	return fmt.Sprintf("{Name: %s Addr: %s Meta: %s}", n.Name, n.Addr.String(), string(n.Meta))
+}
+
 // NodeState is used to manage our state view of another node
 type nodeState struct {
 	Node
