@@ -19,21 +19,25 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
 
 type Memberlist struct {
+	sequenceNum uint32 // Local sequence number
+	incarnation uint32 // Local incarnation number
+	numNodes    uint32 // Number of known nodes (estimate)
+
 	config         *Config
 	shutdown       bool
+	shutdownCh     chan struct{}
 	leave          bool
 	leaveBroadcast chan struct{}
 
 	udpListener *net.UDPConn
 	tcpListener *net.TCPListener
-
-	sequenceNum uint32 // Local sequence number
-	incarnation uint32 // Local incarnation number
+	handoff     chan msgHandoff
 
 	nodeLock sync.RWMutex
 	nodes    []*nodeState          // Known nodes
@@ -105,17 +109,22 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 
 	m := &Memberlist{
 		config:         conf,
+		shutdownCh:     make(chan struct{}),
 		leaveBroadcast: make(chan struct{}, 1),
 		udpListener:    udpLn,
 		tcpListener:    tcpLn,
+		handoff:        make(chan msgHandoff, 1024),
 		nodeMap:        make(map[string]*nodeState),
 		ackHandlers:    make(map[uint32]*ackHandler),
 		broadcasts:     &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
 		logger:         logger,
 	}
-	m.broadcasts.NumNodes = func() int { return len(m.nodes) }
+	m.broadcasts.NumNodes = func() int {
+		return m.estNumNodes()
+	}
 	go m.tcpListen()
 	go m.udpListen()
+	go m.udpHandler()
 	return m, nil
 }
 
@@ -151,19 +160,21 @@ func (m *Memberlist) Join(existing []string) (int, error) {
 	numSuccess := 0
 	var retErr error
 	for _, exist := range existing {
-		addr, port, err := m.resolveAddr(exist)
+		addrs, port, err := m.resolveAddr(exist)
 		if err != nil {
 			m.logger.Printf("[WARN] memberlist: Failed to resolve %s: %v", exist, err)
 			retErr = err
 			continue
 		}
 
-		if err := m.pushPullNode(addr, port, true); err != nil {
-			retErr = err
-			continue
+		for _, addr := range addrs {
+			if err := m.pushPullNode(addr, port, true); err != nil {
+				retErr = err
+				continue
+			}
+			numSuccess++
 		}
 
-		numSuccess++
 	}
 
 	if numSuccess > 0 {
@@ -175,26 +186,42 @@ func (m *Memberlist) Join(existing []string) (int, error) {
 
 // resolveAddr is used to resolve the address into an address,
 // port, and error. If no port is given, use the default
-func (m *Memberlist) resolveAddr(hostStr string) ([]byte, uint16, error) {
-	// Add the port if none
-START:
-	_, _, err := net.SplitHostPort(hostStr)
+func (m *Memberlist) resolveAddr(hostStr string) ([][]byte, uint16, error) {
+	ips := make([][]byte, 0)
+	port := uint16(0)
+	host, sport, err := net.SplitHostPort(hostStr)
 	if ae, ok := err.(*net.AddrError); ok && ae.Err == "missing port in address" {
-		hostStr = fmt.Sprintf("%s:%d", hostStr, m.config.BindPort)
-		goto START
-	}
-	if err != nil {
-		return nil, 0, err
+		// error, port missing - we can solve this
+		port = uint16(m.config.BindPort)
+		host = hostStr
+	} else if err != nil {
+		// error, but not missing port
+		return ips, port, err
+	} else if lport, err := strconv.ParseUint(sport, 10, 16); err != nil {
+		// error, when parsing port
+		return ips, port, err
+	} else {
+		// no error
+		port = uint16(lport)
 	}
 
-	// Get the address
-	addr, err := net.ResolveTCPAddr("tcp", hostStr)
-	if err != nil {
-		return nil, 0, err
+	// Get the addresses that hostPort might resolve to
+	// ResolveTcpAddr requres ipv6 brackets to separate
+	// port numbers whereas ParseIP doesn't, but luckily
+	// SplitHostPort takes care of the brackets
+	if ip := net.ParseIP(host); ip == nil {
+		if pre, err := net.LookupIP(host); err == nil {
+			for _, ip := range pre {
+				ips = append(ips, ip)
+			}
+		} else {
+			return ips, port, err
+		}
+	} else {
+		ips = append(ips, ip)
 	}
 
-	// Return IP/Port
-	return addr.IP, uint16(addr.Port), nil
+	return ips, port, nil
 }
 
 // setAlive is used to mark this node as being alive. This is the same
@@ -262,7 +289,9 @@ func (m *Memberlist) setAlive() error {
 			addr := m.tcpListener.Addr().(*net.TCPAddr)
 			advertiseAddr = addr.IP
 		}
-		advertisePort = m.config.BindPort
+
+		// Use the port we are bound to.
+		advertisePort = m.tcpListener.Addr().(*net.TCPAddr).Port
 	}
 
 	// Check if this is a public address without encryption
@@ -359,6 +388,9 @@ func (m *Memberlist) UpdateNode(timeout time.Duration) error {
 // SendTo is used to directly send a message to another node, without
 // the use of the gossip mechanism. This will encode the message as a
 // user-data message, which a delegate will receive through NotifyMsg
+// The actual data is transmitted over UDP, which means this is a
+// best-effort transmission mechanism, and the maximum size of the
+// message is the size of a single UDP datagram, after compression
 func (m *Memberlist) SendTo(to net.Addr, msg []byte) error {
 	// Encode as a user message
 	buf := make([]byte, 1, len(msg)+1)
@@ -485,12 +517,14 @@ func (m *Memberlist) Shutdown() error {
 	m.startStopLock.Lock()
 	defer m.startStopLock.Unlock()
 
-	if !m.shutdown {
-		m.shutdown = true
-		m.deschedule()
-		m.udpListener.Close()
-		m.tcpListener.Close()
+	if m.shutdown {
+		return nil
 	}
 
+	m.shutdown = true
+	close(m.shutdownCh)
+	m.deschedule()
+	m.udpListener.Close()
+	m.tcpListener.Close()
 	return nil
 }

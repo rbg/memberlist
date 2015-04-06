@@ -46,7 +46,7 @@ type nodeState struct {
 
 // ackHandler is used to register handlers for incoming acks
 type ackHandler struct {
-	handler func()
+	handler func([]byte)
 	timer   *time.Timer
 }
 
@@ -130,7 +130,7 @@ func (m *Memberlist) pushPullTrigger(stop <-chan struct{}) {
 
 	// Tick using a dynamic timer
 	for {
-		tickTime := pushPullScale(interval, len(m.nodes))
+		tickTime := pushPullScale(interval, m.estNumNodes())
 		select {
 		case <-time.After(tickTime):
 			m.pushPull()
@@ -214,7 +214,8 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	destAddr := &net.UDPAddr{IP: node.Addr, Port: int(node.Port)}
 
 	// Setup an ack handler
-	ackCh := make(chan bool, m.config.IndirectChecks+1)
+	ackCh := make(chan ackMessage, m.config.IndirectChecks+1)
+	sent := time.Now()
 	m.setAckChannel(ping.SeqNo, ackCh, m.config.ProbeInterval)
 
 	// Send the ping message
@@ -226,13 +227,16 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	// Wait for response or round-trip-time
 	select {
 	case v := <-ackCh:
-		if v == true {
+		if v.Complete == true {
+			if m.config.Ping != nil {
+				m.config.Ping.NotifyPingComplete(&node.Node, time.Now().Sub(sent), v.Payload)
+			}
 			return
 		}
 
 		// As an edge case, if we get a timeout, we need to re-enqueue it
 		// here to break out of the select below
-		if v == false {
+		if v.Complete == false {
 			ackCh <- v
 		}
 	case <-time.After(m.config.ProbeTimeout):
@@ -256,13 +260,13 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	// Wait for the acks or timeout
 	select {
 	case v := <-ackCh:
-		if v == true {
+		if v.Complete == true {
 			return
 		}
 	}
 
 	// No acks received from target, suspect
-	s := suspect{Incarnation: node.Incarnation, Node: node.Name}
+	s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
 	m.suspectNode(&s)
 }
 
@@ -277,11 +281,15 @@ func (m *Memberlist) resetNodes() {
 
 	// Deregister the dead nodes
 	for i := deadIdx; i < len(m.nodes); i++ {
+		delete(m.nodeMap, m.nodes[i].Name)
 		m.nodes[i] = nil
 	}
 
 	// Trim the nodes to exclude the dead nodes
 	m.nodes = m.nodes[0:deadIdx]
+
+	// Update numNodes after we've trimmed the dead nodes
+	atomic.StoreUint32(&m.numNodes, uint32(deadIdx))
 
 	// Shuffle live nodes
 	shuffleNodes(m.nodes)
@@ -298,6 +306,9 @@ func (m *Memberlist) gossip() {
 
 	// Compute the bytes available
 	bytesAvail := udpSendBuf - compoundHeaderOverhead
+	if m.config.EncryptionEnabled() {
+		bytesAvail -= encryptOverhead(m.encryptionVersion())
+	}
 
 	for _, node := range kNodes {
 		// Get any pending broadcasts
@@ -350,6 +361,29 @@ func (m *Memberlist) pushPullNode(addr []byte, port uint16, join bool) error {
 
 	if err := m.verifyProtocol(remote); err != nil {
 		return err
+	}
+
+	// Invoke the merge delegate if any
+	if join && m.config.Merge != nil {
+		nodes := make([]*Node, len(remote))
+		for idx, n := range remote {
+			nodes[idx] = &Node{
+				Name: n.Name,
+				Addr: n.Addr,
+				Port: n.Port,
+				Meta: n.Meta,
+				PMin: n.Vsn[0],
+				PMax: n.Vsn[1],
+				PCur: n.Vsn[2],
+				DMin: n.Vsn[3],
+				DMax: n.Vsn[4],
+				DCur: n.Vsn[5],
+			}
+		}
+		if err := m.config.Merge.NotifyMerge(nodes); err != nil {
+			m.logger.Printf("[WARN] memberlist: Cluster merge canceled: %s", err)
+			return err
+		}
 	}
 
 	// Merge the state
@@ -491,14 +525,23 @@ func (m *Memberlist) nextIncarnation() uint32 {
 	return atomic.AddUint32(&m.incarnation, 1)
 }
 
-// setAckChannel is used to attach a channel to receive a message when
-// an ack with a given sequence number is received. The channel gets sent
-// false on timeout
-func (m *Memberlist) setAckChannel(seqNo uint32, ch chan bool, timeout time.Duration) {
+// estNumNodes is used to get the current estimate of the number of nodes
+func (m *Memberlist) estNumNodes() int {
+	return int(atomic.LoadUint32(&m.numNodes))
+}
+
+type ackMessage struct {
+	Complete bool
+	Payload  []byte
+}
+
+// setAckChannel is used to attach a channel to receive a message when an ack with a given
+// sequence number is received. The `complete` field of the message will be false on timeout
+func (m *Memberlist) setAckChannel(seqNo uint32, ch chan ackMessage, timeout time.Duration) {
 	// Create a handler function
-	handler := func() {
+	handler := func(payload []byte) {
 		select {
-		case ch <- true:
+		case ch <- ackMessage{true, payload}:
 		default:
 		}
 	}
@@ -515,7 +558,7 @@ func (m *Memberlist) setAckChannel(seqNo uint32, ch chan bool, timeout time.Dura
 		delete(m.ackHandlers, seqNo)
 		m.ackLock.Unlock()
 		select {
-		case ch <- false:
+		case ch <- ackMessage{false, nil}:
 		default:
 		}
 	})
@@ -524,7 +567,7 @@ func (m *Memberlist) setAckChannel(seqNo uint32, ch chan bool, timeout time.Dura
 // setAckHandler is used to attach a handler to be invoked when an
 // ack with a given sequence number is received. If a timeout is reached,
 // the handler is deleted
-func (m *Memberlist) setAckHandler(seqNo uint32, handler func(), timeout time.Duration) {
+func (m *Memberlist) setAckHandler(seqNo uint32, handler func(payload []byte), timeout time.Duration) {
 	// Add the handler
 	ah := &ackHandler{handler, nil}
 	m.ackLock.Lock()
@@ -540,16 +583,16 @@ func (m *Memberlist) setAckHandler(seqNo uint32, handler func(), timeout time.Du
 }
 
 // Invokes an Ack handler if any is associated, and reaps the handler immediately
-func (m *Memberlist) invokeAckHandler(seqNo uint32) {
+func (m *Memberlist) invokeAckHandler(ack ackResp) {
 	m.ackLock.Lock()
-	ah, ok := m.ackHandlers[seqNo]
-	delete(m.ackHandlers, seqNo)
+	ah, ok := m.ackHandlers[ack.SeqNo]
+	delete(m.ackHandlers, ack.SeqNo)
 	m.ackLock.Unlock()
 	if !ok {
 		return
 	}
 	ah.timer.Stop()
-	ah.handler()
+	ah.handler(ack.Payload)
 }
 
 // aliveNode is invoked by the network layer when we get a message about a
@@ -593,6 +636,9 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		// Add at the end and swap with the node at the offset
 		m.nodes = append(m.nodes, state)
 		m.nodes[offset], m.nodes[n] = m.nodes[n], m.nodes[offset]
+
+		// Update numNodes after we've added a new node
+		atomic.AddUint32(&m.numNodes, 1)
 	}
 
 	// Check if this address is different than the existing node
@@ -747,7 +793,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			},
 		}
 		m.encodeAndBroadcast(s.Node, aliveMsg, a)
-		m.logger.Printf("[WARN] memberlist: Refuting a suspect message (state: %#v )", state)
+		m.logger.Printf("[WARN] memberlist: Refuting a suspect message (from: %s)", s.From)
 		return // Do not mark ourself suspect
 	} else {
 		m.encodeAndBroadcast(s.Node, suspectMsg, s)
@@ -760,7 +806,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	state.StateChange = changeTime
 
 	// Setup a timeout for this
-	timeout := suspicionTimeout(m.config.SuspicionMult, len(m.nodes), m.config.ProbeInterval)
+	timeout := suspicionTimeout(m.config.SuspicionMult, m.estNumNodes(), m.config.ProbeInterval)
 	time.AfterFunc(timeout, func() {
 		m.nodeLock.Lock()
 		state, ok := m.nodeMap[s.Node]
@@ -776,7 +822,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 // suspectTimeout is invoked when a suspect timeout has occurred
 func (m *Memberlist) suspectTimeout(n *nodeState) {
 	// Construct a dead message
-	d := dead{Incarnation: n.Incarnation, Node: n.Name}
+	d := dead{Incarnation: n.Incarnation, Node: n.Name, From: m.config.Name}
 	m.deadNode(&d)
 }
 
@@ -824,7 +870,7 @@ func (m *Memberlist) deadNode(d *dead) {
 				},
 			}
 			m.encodeAndBroadcast(d.Node, aliveMsg, a)
-			m.logger.Printf("[WARN] memberlist: Refuting a dead message")
+			m.logger.Printf("[WARN] memberlist: Refuting a dead message (from: %s)", d.From)
 			return // Do not mark ourself dead
 		}
 
@@ -838,9 +884,6 @@ func (m *Memberlist) deadNode(d *dead) {
 	state.Incarnation = d.Incarnation
 	state.State = stateDead
 	state.StateChange = time.Now()
-
-	// Remove from the node map
-	delete(m.nodeMap, state.Name)
 
 	// Notify of death
 	if m.config.Events != nil {
@@ -869,7 +912,7 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 			// suspect that node instead of declaring it dead instantly
 			fallthrough
 		case stateSuspect:
-			s := suspect{Incarnation: r.Incarnation, Node: r.Name}
+			s := suspect{Incarnation: r.Incarnation, Node: r.Name, From: m.config.Name}
 			m.suspectNode(&s)
 		}
 	}

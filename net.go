@@ -5,10 +5,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"github.com/ugorji/go/codec"
 	"io"
 	"net"
 	"time"
+
+	"github.com/ugorji/go/codec"
 )
 
 // This is the minimum and maximum protocol version that we can
@@ -77,13 +78,15 @@ type indirectPingReq struct {
 
 // ack response is sent for a ping
 type ackResp struct {
-	SeqNo uint32
+	SeqNo   uint32
+	Payload []byte
 }
 
 // suspect is broadcast when we suspect a node is dead
 type suspect struct {
 	Incarnation uint32
 	Node        string
+	From        string // Include who is suspecting
 }
 
 // alive is broadcast when we know a node is alive.
@@ -105,6 +108,7 @@ type alive struct {
 type dead struct {
 	Incarnation uint32
 	Node        string
+	From        string // Include who is suspecting
 }
 
 // pushPullHeader is used to inform the
@@ -132,6 +136,13 @@ type pushNodeState struct {
 type compress struct {
 	Algo compressionType
 	Buf  []byte
+}
+
+// msgHandoff is used to transfer a message between goroutines
+type msgHandoff struct {
+	msgType messageType
+	buf     []byte
+	from    net.Addr
 }
 
 // encryptionVersion returns the encryption version to use
@@ -192,6 +203,29 @@ func (m *Memberlist) handleConn(conn *net.TCPConn) {
 		return
 	}
 
+	// Invoke the merge delegate if any
+	if join && m.config.Merge != nil {
+		nodes := make([]*Node, len(remoteNodes))
+		for idx, n := range remoteNodes {
+			nodes[idx] = &Node{
+				Name: n.Name,
+				Addr: n.Addr,
+				Port: n.Port,
+				Meta: n.Meta,
+				PMin: n.Vsn[0],
+				PMax: n.Vsn[1],
+				PCur: n.Vsn[2],
+				DMin: n.Vsn[3],
+				DMax: n.Vsn[4],
+				DCur: n.Vsn[5],
+			}
+		}
+		if err := m.config.Merge.NotifyMerge(nodes); err != nil {
+			m.logger.Printf("[WARN] memberlist: Cluster merge canceled: %s", err)
+			return
+		}
+	}
+
 	// Merge the membership state
 	m.mergeState(remoteNodes)
 
@@ -203,7 +237,6 @@ func (m *Memberlist) handleConn(conn *net.TCPConn) {
 
 // udpListen listens for and handles incoming UDP packets
 func (m *Memberlist) udpListen() {
-	mainBuf := make([]byte, udpBufSize)
 	var n int
 	var addr net.Addr
 	var err error
@@ -217,8 +250,9 @@ func (m *Memberlist) udpListen() {
 				diff)
 		}
 
-		// Reset buffer
-		buf := mainBuf[0:udpBufSize]
+		// Create a new buffer
+		// TODO: Use Sync.Pool eventually
+		buf := make([]byte, udpBufSize)
 
 		// Read a packet
 		n, addr, err = m.udpListener.ReadFrom(buf)
@@ -272,24 +306,61 @@ func (m *Memberlist) handleCommand(buf []byte, from net.Addr) {
 	switch msgType {
 	case compoundMsg:
 		m.handleCompound(buf, from)
+	case compressMsg:
+		m.handleCompressed(buf, from)
+
 	case pingMsg:
 		m.handlePing(buf, from)
 	case indirectPingMsg:
 		m.handleIndirectPing(buf, from)
 	case ackRespMsg:
 		m.handleAck(buf, from)
+
 	case suspectMsg:
-		m.handleSuspect(buf, from)
+		fallthrough
 	case aliveMsg:
-		m.handleAlive(buf, from)
+		fallthrough
 	case deadMsg:
-		m.handleDead(buf, from)
+		fallthrough
 	case userMsg:
-		m.handleUser(buf, from)
-	case compressMsg:
-		m.handleCompressed(buf, from)
+		select {
+		case m.handoff <- msgHandoff{msgType, buf, from}:
+		default:
+			m.logger.Printf("[WARN] memberlist: UDP handler queue full, dropping message (%d)", msgType)
+		}
+
 	default:
 		m.logger.Printf("[ERR] memberlist: UDP msg type (%d) not supported. From: %s", msgType, from)
+	}
+}
+
+// udpHandler processes messages received over UDP, but is decoupled
+// from the listener to avoid blocking the listener which may cause
+// ping/ack messages to be delayed.
+func (m *Memberlist) udpHandler() {
+	for {
+		select {
+		case msg := <-m.handoff:
+			msgType := msg.msgType
+			buf := msg.buf
+			from := msg.from
+
+			switch msgType {
+			case suspectMsg:
+				m.handleSuspect(buf, from)
+			case aliveMsg:
+				m.handleAlive(buf, from)
+			case deadMsg:
+				m.handleDead(buf, from)
+			case userMsg:
+				m.handleUser(buf, from)
+			default:
+				m.logger.Printf("[ERR] memberlist: UDP msg type (%d) not supported. From: %s (handler)", msgType, from)
+			}
+
+		case <-m.shutdownCh:
+			return
+		}
 	}
 }
 
@@ -323,7 +394,11 @@ func (m *Memberlist) handlePing(buf []byte, from net.Addr) {
 		m.logger.Printf("[WARN] memberlist: Got ping for unexpected node '%s'", p.Node)
 		return
 	}
-	ack := ackResp{p.SeqNo}
+	var ack ackResp
+	ack.SeqNo = p.SeqNo
+	if m.config.Ping != nil {
+		ack.Payload = m.config.Ping.AckPayload()
+	}
 	if err := m.encodeAndSendMsg(from, ackRespMsg, &ack); err != nil {
 		m.logger.Printf("[ERR] memberlist: Failed to send ack: %s", err)
 	}
@@ -348,10 +423,16 @@ func (m *Memberlist) handleIndirectPing(buf []byte, from net.Addr) {
 	destAddr := &net.UDPAddr{IP: ind.Target, Port: int(ind.Port)}
 
 	// Setup a response handler to relay the ack
-	respHandler := func() {
-		ack := ackResp{ind.SeqNo}
+	sent := time.Now()
+	respHandler := func(payload []byte) {
+		ack := ackResp{ind.SeqNo, nil}
 		if err := m.encodeAndSendMsg(from, ackRespMsg, &ack); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to forward ack: %s", err)
+		}
+		if m.config.Ping != nil {
+			if n, ok := m.nodeMap[ind.Node]; ok {
+				m.config.Ping.NotifyPingComplete(&n.Node, time.Now().Sub(sent), payload)
+			}
 		}
 	}
 	m.setAckHandler(localSeqNo, respHandler, m.config.ProbeTimeout)
@@ -368,7 +449,7 @@ func (m *Memberlist) handleAck(buf []byte, from net.Addr) {
 		m.logger.Printf("[ERR] memberlist: Failed to decode ack response: %s", err)
 		return
 	}
-	m.invokeAckHandler(ack.SeqNo)
+	m.invokeAckHandler(ack)
 }
 
 func (m *Memberlist) handleSuspect(buf []byte, from net.Addr) {

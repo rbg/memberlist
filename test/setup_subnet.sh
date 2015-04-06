@@ -8,8 +8,8 @@
 ping -c 1 -W 10 127.0.0.2 > /dev/null 2>&1
 if [ $? -eq 0 ]
 then
-    echo "setup has already run"
-    exit 1
+    echo "setup done"
+    exit 0
 fi
 
 # If we're not on OS X, then error
