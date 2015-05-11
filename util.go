@@ -5,12 +5,13 @@ import (
 	"compress/lzw"
 	"encoding/binary"
 	"fmt"
-	"github.com/hashicorp/go-msgpack/codec"
 	"io"
 	"math"
 	"math/rand"
 	"net"
 	"time"
+
+	"github.com/ugorji/go/codec"
 )
 
 // pushPullScale is the minimum number of nodes

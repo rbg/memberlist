@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"github.com/hashicorp/go-msgpack/codec"
 	"io"
 	"net"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/ugorji/go/codec"
 )
 
 func TestHandleCompoundPing(t *testing.T) {
