@@ -322,7 +322,7 @@ func (m *Memberlist) gossip() {
 
 		// Send the compound message
 		destAddr := &net.UDPAddr{IP: node.Addr, Port: int(node.Port)}
-		if err := m.rawSendMsg(destAddr, compound.Bytes()); err != nil {
+		if err := m.rawSendMsgUDP(destAddr, compound.Bytes()); err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to send gossip to %s: %s", destAddr, err)
 		}
 	}
@@ -359,39 +359,8 @@ func (m *Memberlist) pushPullNode(addr []byte, port uint16, join bool) error {
 		return err
 	}
 
-	if err := m.verifyProtocol(remote); err != nil {
+	if err := m.mergeRemoteState(join, remote, userState); err != nil {
 		return err
-	}
-
-	// Invoke the merge delegate if any
-	if join && m.config.Merge != nil {
-		nodes := make([]*Node, len(remote))
-		for idx, n := range remote {
-			nodes[idx] = &Node{
-				Name: n.Name,
-				Addr: n.Addr,
-				Port: n.Port,
-				Meta: n.Meta,
-				PMin: n.Vsn[0],
-				PMax: n.Vsn[1],
-				PCur: n.Vsn[2],
-				DMin: n.Vsn[3],
-				DMax: n.Vsn[4],
-				DCur: n.Vsn[5],
-			}
-		}
-		if err := m.config.Merge.NotifyMerge(nodes); err != nil {
-			m.logger.Printf("[WARN] memberlist: Cluster merge canceled: %s", err)
-			return err
-		}
-	}
-
-	// Merge the state
-	m.mergeState(remote)
-
-	// Invoke the delegate
-	if m.config.Delegate != nil {
-		m.config.Delegate.MergeRemoteState(userState, join)
 	}
 	return nil
 }
@@ -608,6 +577,30 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	// ensures that we don't.
 	if m.leave && a.Node == m.config.Name {
 		return
+	}
+
+	// Invoke the Alive delegate if any. This can be used to filter out
+	// alive messages based on custom logic. For example, using a cluster name.
+	// Using a merge delegate is not enough, as it is possible for passive
+	// cluster merging to still occur.
+	if m.config.Alive != nil {
+		node := &Node{
+			Name: a.Node,
+			Addr: a.Addr,
+			Port: a.Port,
+			Meta: a.Meta,
+			PMin: a.Vsn[0],
+			PMax: a.Vsn[1],
+			PCur: a.Vsn[2],
+			DMin: a.Vsn[3],
+			DMax: a.Vsn[4],
+			DCur: a.Vsn[5],
+		}
+		if err := m.config.Alive.NotifyAlive(node); err != nil {
+			m.logger.Printf("[WARN] memberlist: ignoring alive message for '%s': %s",
+				a.Node, err)
+			return
+		}
 	}
 
 	// Check if we've never seen this node before, and if not, then

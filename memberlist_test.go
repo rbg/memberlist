@@ -388,7 +388,7 @@ func TestMemberlist_Join_Cancel(t *testing.T) {
 
 	m2, err := Create(c)
 	if err != nil {
-		t.Fatal("unexpected err: %s", err)
+		t.Fatalf("unexpected err: %s", err)
 	}
 	merge2 := &CustomMergeDelegate{}
 	m2.config.Merge = merge2
