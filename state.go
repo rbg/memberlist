@@ -36,6 +36,10 @@ func (n Node) String() string {
 	return fmt.Sprintf("{Name: %s Addr: %s Meta: %s}", n.Name, n.Addr.String(), string(n.Meta))
 }
 
+func (n Node) Key() string {
+	return n.Addr.String()
+}
+
 // NodeState is used to manage our state view of another node
 type nodeState struct {
 	Node
