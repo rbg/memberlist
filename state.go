@@ -33,7 +33,8 @@ type Node struct {
 }
 
 func (n Node) String() string {
-	return fmt.Sprintf("{Name: %s Addr: %s Meta: %s}", n.Name, n.Addr.String(), string(n.Meta))
+	return fmt.Sprintf("{Name: %s Addr: %s Port: %d Meta: %s}", n.Name,
+		n.Addr.String(), n.Port, string(n.Meta))
 }
 
 func (n Node) Key() string {
