@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"time"
+
 	"github.com/ugorji/go/codec"
 )
 
@@ -53,7 +54,7 @@ const (
 	udpRecvBuf             = 2 * 1024 * 1024
 	udpSendBuf             = 1400
 	userMsgOverhead        = 1
-	blockingWarning        = 10 * time.Millisecond // Warn if a UDP packet takes this long to process
+	blockingWarning        = 30 * time.Millisecond // Warn if a UDP packet takes this long to process
 	maxPushStateBytes      = 10 * 1024 * 1024
 )
 
